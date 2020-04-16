@@ -1,0 +1,925 @@
+# Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
+# https://aws.amazon.com/agreement
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+    This CloudFormation template shows how to automate AWS Fargate cluster
+    deployment backed by EFS share, which is connected using Access Points (RCS-1629).
+
+Metadata:
+    Authors:
+        Description: Andrei Maksimov <awsam@amazon.com>
+    License:
+        Description: >
+            Copyright 2017 Amazon.com, Inc. and its affiliates. All Rights Reserved.
+            Licensed under the Amazon Software License (the "License"). You may not use this file
+            except in compliance with the License. A copy of the License is located at
+            http://aws.amazon.com/asl/
+            or in the "license" file accompanying this file. This file is distributed on an "AS IS"
+            BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+            License for the specific language governing permissions and limitations under the License.
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            -
+                Label:
+                    default: "Fargate parameters"
+                Parameters:
+                    - pFargateServiceName
+            -
+                Label:
+                    default: "Docker container configuration"
+                Parameters:
+                    - pFargateServiceName
+                    - pFargateTaskDockerImage
+                    - pFargateTaskContainerPort
+        ParameterLabels:
+            pFargateServiceName:
+                default: "Provide service name to launch Fargate tasks:"
+            pFargateTaskDockerImage:
+                default: "What Docker image to deploy as a service?"
+            pFargateTaskContainerPort:
+                default: "What port does Fargate task listen?"
+
+Parameters:
+    pFargateServiceName:
+        Description: ECS Fargate service name
+        Type: String
+        Default: cloudcmd
+        MaxLength: 50
+    pFargateTaskDockerImage:
+        Description: Docker image to be launched as Fargate service
+        Type: String
+        Default: coderaiser/cloudcmd
+        MaxLength: 128
+    pFargateTaskContainerPort:
+        Description: Container port to expose
+        Type: Number
+        Default: 8000
+        MinValue: 1
+        MaxValue: 65534
+
+Resources:
+    rVPC:
+      Type: 'AWS::EC2::VPC'
+      Properties:
+          CidrBlock: '10.0.0.0/16'
+          EnableDnsHostnames: True
+          EnableDnsSupport: True
+          Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-vpc'
+
+    rPublicSubnet1:
+      Type: 'AWS::EC2::Subnet'
+      Properties:
+          VpcId: !Ref rVPC
+          CidrBlock: !Select [0, !Cidr [ !GetAtt rVPC.CidrBlock, 8, 12]]
+          MapPublicIpOnLaunch: True
+          AvailabilityZone: !Select 
+              - 0
+              - Fn::GetAZs: !Ref 'AWS::Region'
+          Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-public-1'
+
+    rPublicSubnet2:
+        Type: 'AWS::EC2::Subnet'
+        Properties:
+          VpcId: !Ref rVPC
+          CidrBlock: !Select [1, !Cidr [ !GetAtt rVPC.CidrBlock, 8, 12]]
+          MapPublicIpOnLaunch: True
+          AvailabilityZone: !Select 
+              - 1
+              - Fn::GetAZs: !Ref 'AWS::Region'
+          Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-public-2'
+
+    rPublicSubnet3:
+        Type: 'AWS::EC2::Subnet'
+        Properties:
+            VpcId: !Ref rVPC
+            CidrBlock: !Select [2, !Cidr [ !GetAtt rVPC.CidrBlock, 8, 12]]
+            MapPublicIpOnLaunch: True
+            AvailabilityZone: !Select 
+                - 2
+                - Fn::GetAZs: !Ref 'AWS::Region'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-public-3'
+
+    rIGW:
+        Type: 'AWS::EC2::InternetGateway'
+        Properties:
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-igw'
+
+    rIgwAttachment:
+        Type: 'AWS::EC2::VPCGatewayAttachment'
+        Properties:
+            VpcId: !Ref rVPC
+            InternetGatewayId: !Ref rIGW
+
+    rPublicRouteTable:
+        Type: 'AWS::EC2::RouteTable'
+        Properties:
+            VpcId: !Ref rVPC
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-public-rtb'
+
+    rPublicRoute:
+        Type: 'AWS::EC2::Route'
+        Properties:
+            RouteTableId: !Ref rPublicRouteTable
+            DestinationCidrBlock: 0.0.0.0/0
+            GatewayId: !Ref rIGW
+
+    rPublicSubnetRouteAssociation1:
+        Type: 'AWS::EC2::SubnetRouteTableAssociation'
+        Properties:
+            RouteTableId: !Ref rPublicRouteTable
+            SubnetId: !Ref rPublicSubnet1
+
+    rPublicSubnetRouteAssociation2:
+        Type: 'AWS::EC2::SubnetRouteTableAssociation'
+        Properties:
+            RouteTableId: !Ref rPublicRouteTable
+            SubnetId: !Ref rPublicSubnet2
+
+    rPublicSubnetRouteAssociation3:
+        Type: 'AWS::EC2::SubnetRouteTableAssociation'
+        Properties:
+            RouteTableId: !Ref rPublicRouteTable
+            SubnetId: !Ref rPublicSubnet3
+
+    rEFS:
+        Type: AWS::EFS::FileSystem
+        Properties:
+            FileSystemTags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-efs'
+
+    rEfsSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            VpcId: !Ref rVPC
+            GroupName: !Sub "${AWS::StackName}-efs-sg"
+            GroupDescription: !Sub "${AWS::StackName}-efs-sg"
+            SecurityGroupIngress:
+                -
+                    IpProtocol: tcp
+                    FromPort: 2049
+                    ToPort: 2049
+                    CidrIp: !GetAtt rVPC.CidrBlock
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-efs-sg'
+
+
+    rEfsMountTarget1: 
+        Type: AWS::EFS::MountTarget
+        Properties: 
+            FileSystemId: !Ref rEFS
+            SubnetId: !Ref rPublicSubnet1
+            SecurityGroups: 
+                - !Ref rEfsSecurityGroup
+
+    rEfsMountTarget2: 
+        Type: AWS::EFS::MountTarget
+        Properties: 
+            FileSystemId: !Ref rEFS
+            SubnetId: !Ref rPublicSubnet2
+            SecurityGroups: 
+                - !Ref rEfsSecurityGroup
+
+    rEfsMountTarget3: 
+        Type: AWS::EFS::MountTarget
+        Properties: 
+            FileSystemId: !Ref rEFS
+            SubnetId: !Ref rPublicSubnet3
+            SecurityGroups: 
+                - !Ref rEfsSecurityGroup
+
+    rAccessPointResource:
+        Type: 'Custom::EfsAccessPoint'
+        Properties:
+            ServiceToken: !GetAtt rAccessPointManagerLambdaFunction.Arn
+            FileSystemId: !Ref rEFS
+            PosixUserUid: 1000
+            PosixUserGid: 1000
+            RootDirectoryPath: '/uploads'
+            RootDirectoryUid: 1000
+            RootDirectoryGid: 1000
+            RootDirectoryPermissions: '755'
+
+    rAccessPointManagerLambdaFunctionRole:
+        Type: 'AWS::IAM::Role'
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service:
+                                - lambda.amazonaws.com
+                        Action:
+                            - 'sts:AssumeRole'
+            Path: /
+            Policies:
+                -
+                    PolicyName: root
+                    PolicyDocument:
+                        Version: '2012-10-17'
+                        Statement:
+                          - 
+                              Effect: Allow
+                              Action:
+                                  - 'logs:CreateLogGroup'
+                                  - 'logs:CreateLogStream'
+                                  - 'logs:PutLogEvents'
+                              Resource: '*'
+                          -
+                              Effect: Allow
+                              Action:
+                                  - 'elasticfilesystem:CreateAccessPoint'
+                              Resource: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/*'
+                          -
+                              Effect: Allow
+                              Action:
+                                  - 'elasticfilesystem:DeleteAccessPoint'
+                                  - 'elasticfilesystem:DescribeAccessPoints'
+                              Resource: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:access-point/*'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-access-point-manager-lambda-role'
+
+    rAccessPointManagerLambdaFunctionLogGroup:
+        Type: 'AWS::Logs::LogGroup'
+        DependsOn:
+            - rAccessPointManagerLambdaFunction
+        DeletionPolicy: Delete
+        Properties:
+            LogGroupName: !Sub '/aws/lambda/${rAccessPointManagerLambdaFunction}'
+            RetentionInDays: 7
+
+    rAccessPointManagerLambdaFunction:
+        Type: 'AWS::Lambda::Function'
+        Properties:
+            Runtime: python3.7
+            Timeout: 300
+            Handler: index.handler
+            Role: !GetAtt rAccessPointManagerLambdaFunctionRole.Arn
+            Code:
+                ZipFile: |
+                  import logging
+                  import time
+                  import traceback
+                  import boto3
+                  import cfnresponse
+
+                  LOGGER = logging.getLogger()
+                  LOGGER.setLevel(logging.INFO)
+
+                  EFS_CLIENT = boto3.client('efs')
+
+                  def create_access_point(event, context):
+                      LOGGER.info('Creating EFS Access Point')
+                      file_system_id = event['ResourceProperties']['FileSystemId'] if 'FileSystemId' in event['ResourceProperties'] else None
+                      posix_user_uid = int(event['ResourceProperties']['PosixUserUid']) if 'PosixUserUid' in event['ResourceProperties'] else 0
+                      posix_user_gid = int(event['ResourceProperties']['PosixUserGid']) if 'PosixUserGid' in event['ResourceProperties'] else 0
+                      posix_user_sec_gids = [ int(sgid) for sgid in event['ResourceProperties']['PosixUserSecondaryGids'].split(',')] if 'PosixUserSecondaryGids' in event['ResourceProperties'] else []
+                      root_dir_path = event['ResourceProperties']['RootDirectoryPath'] if 'RootDirectoryPath' in event['ResourceProperties'] else '/'
+                      root_dir_owner_uid = int(event['ResourceProperties']['RootDirectoryUid']) if 'RootDirectoryUid' in event['ResourceProperties'] else 0
+                      root_dir_owner_gid = int(event['ResourceProperties']['RootDirectoryGid']) if 'RootDirectoryGid' in event['ResourceProperties'] else 0
+                      root_dir_owner_perm = event['ResourceProperties']['RootDirectoryPermissions'] if 'RootDirectoryPermissions' in event['ResourceProperties'] else '644'
+
+                      request_params = {
+                          'Tags': [
+                              {
+                                  'Key': 'Name',
+                                  'Value': f"{file_system_id}-{root_dir_path}"
+                              },
+                          ],
+                          'FileSystemId': file_system_id,
+                          'PosixUser': {
+                              'Uid': posix_user_uid,
+                              'Gid': posix_user_gid,
+                              'SecondaryGids': posix_user_sec_gids
+                          },
+                          'RootDirectory': {
+                              'Path': root_dir_path,
+                              'CreationInfo': {
+                                  'OwnerUid': root_dir_owner_uid,
+                                  'OwnerGid': root_dir_owner_gid,
+                                  'Permissions': root_dir_owner_perm
+                              }
+                          }
+                      }
+
+                      LOGGER.info('request_params: %s', request_params)
+
+                      response = EFS_CLIENT.create_access_point(**request_params)
+
+                      LOGGER.info('response: %s', response)
+
+                      access_point_id = response['AccessPointId']
+                      access_point_arn = response['AccessPointArn']
+
+                      while True:
+                          response = EFS_CLIENT.describe_access_points(AccessPointId=access_point_id)
+                          if response['AccessPoints'][0]['LifeCycleState'] == 'available':
+                              break
+                          time.sleep(1)
+
+                      return_data = {
+                          'Id': access_point_id,
+                          'Arn': access_point_arn
+                      }
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, return_data, physicalResourceId=access_point_id)
+
+                  def delete_access_point(event, context):
+                      LOGGER.info('Deleting EFS Access Point')
+
+                      access_point_id = event['PhysicalResourceId']
+
+                      request_params = {
+                          'AccessPointId': access_point_id
+                      }
+
+                      LOGGER.info('request_params: %s', request_params)
+
+                      EFS_CLIENT.delete_access_point(**request_params)
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+                  def update_access_point(event, context):
+                      LOGGER.info('Updating EFS Access Point')
+                      delete_access_point(event, context)
+                      create_access_point(event, context)
+
+                  def handler(event, context):
+                      LOGGER.info('Event: %s', event)
+                      try:
+                          if event['RequestType'] == 'Create':
+                              create_access_point(event, context)
+                          elif event['RequestType'] == 'Update':
+                              update_access_point(event, context)
+                          elif event['RequestType'] == 'Delete':
+                              delete_access_point(event, context)
+                      except Exception as err:
+                          LOGGER.error(err)
+                          traceback.print_exc()
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {})
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-access-point-manager-lambda'
+
+    rFargateCluster:
+        Type: 'Custom::FargateCluster'
+        Properties:
+            ServiceToken: !GetAtt rFargateClusterLambdaFunction.Arn
+
+    rFargateClusterLambdaFunctionLogGroup:
+        Type: 'AWS::Logs::LogGroup'
+        DependsOn:
+            - rFargateClusterLambdaFunction
+        DeletionPolicy: Delete
+        Properties:
+            LogGroupName: !Sub '/aws/lambda/${rFargateClusterLambdaFunction}'
+            RetentionInDays: 7
+
+    rFargateClusterLambdaFunctionRole:
+        Type: 'AWS::IAM::Role'
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service:
+                              - lambda.amazonaws.com
+                        Action:
+                            - 'sts:AssumeRole'
+            Path: /
+            Policies:
+                -
+                    PolicyName: root
+                    PolicyDocument:
+                      Version: '2012-10-17'
+                      Statement:
+                        - Effect: Allow
+                          Action:
+                              - 'logs:CreateLogGroup'
+                              - 'logs:CreateLogStream'
+                              - 'logs:PutLogEvents'
+                          Resource: '*'
+                        - Effect: Allow
+                          Action:
+                              - 'ecs:CreateCluster'
+                              - 'ecs:DeleteCluster'
+                          Resource: '*'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-fargate-cluster-lambda-role'
+
+    rFargateClusterLambdaFunction:
+        Type: 'AWS::Lambda::Function'
+        Properties:
+            Runtime: python3.7
+            Timeout: 300
+            Handler: index.handler
+            Role: !GetAtt rFargateClusterLambdaFunctionRole.Arn
+            Code:
+                ZipFile: !Sub
+                    - |-
+                        import logging
+                        import traceback
+                        import boto3
+                        import cfnresponse
+
+                        LOGGER = logging.getLogger()
+                        LOGGER.setLevel(logging.INFO)
+
+                        ECS_CLIENT = boto3.client('ecs')
+
+                        def create_cluster(event, context):
+
+                            LOGGER.info('Creating Fargate cluster')
+                            
+                            stack_name = '${stack_name}'
+
+                            request_params = {
+                                'clusterName': f"{stack_name}-fargate-cluster",
+                                'capacityProviders': [
+                                    'FARGATE',
+                                    'FARGATE_SPOT'
+                                ],
+                                'defaultCapacityProviderStrategy': [
+                                    {
+                                        'capacityProvider': 'FARGATE',
+                                        'weight': 1,
+                                        'base': 1
+                                    },
+                                    {
+                                        'capacityProvider': 'FARGATE_SPOT',
+                                        'weight': 1
+                                    }
+                                ]
+                            }
+
+                            response = ECS_CLIENT.create_cluster(**request_params)
+
+                            cluster_name = response['cluster']['clusterName']
+                            cluster_arn = response['cluster']['clusterArn']
+
+                            return_data = {
+                                'ClusterName': cluster_name,
+                                'Arn': cluster_arn
+                            }
+
+                            cfnresponse.send(
+                                event,
+                                context,
+                                cfnresponse.SUCCESS,
+                                return_data,
+                                physicalResourceId=cluster_name
+                            )
+
+                        def delete_cluster(event, context):
+                            LOGGER.info('Deleting Fargate cluster')
+
+                            cluster_name = event['PhysicalResourceId']
+
+                            request_params = {
+                                'cluster': cluster_name
+                            }
+
+                            LOGGER.info('request_params: %s', request_params)
+
+                            ECS_CLIENT.delete_cluster(**request_params)
+
+                            cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+                        def handler(event, context):
+                            LOGGER.info('Event: %s', event)
+
+                            try:
+                                if event['RequestType'] == 'Create':
+                                    create_cluster(event, context)
+                                elif event['RequestType'] == 'Delete':
+                                    delete_cluster(event, context)
+                            except Exception as err:
+                                LOGGER.error(err)
+                                traceback.print_exc()
+                                cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                    -
+                        stack_name: !Sub '${AWS::StackName}'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-fargate-lambda-function'
+
+    rFargateExecutionRole:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: !Sub '${AWS::StackName}-${pFargateServiceName}-execution-role'
+            AssumeRolePolicyDocument:
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: ecs-tasks.amazonaws.com
+                        Action: 'sts:AssumeRole'
+            ManagedPolicyArns:
+                - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-fargate-execution-role'
+
+    rFargateTaskRole:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: !Sub '${AWS::StackName}-${pFargateServiceName}-task-role'
+            AssumeRolePolicyDocument:
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: ecs-tasks.amazonaws.com
+                        Action: 'sts:AssumeRole'
+            Path: /
+            Policies:
+                -
+                    PolicyName: root
+                    PolicyDocument:
+                        Version: '2012-10-17'
+                        Statement:
+                            -
+                                Effect: Allow
+                                Action:
+                                    - 'logs:CreateLogGroup'
+                                    - 'logs:CreateLogStream'
+                                    - 'logs:PutLogEvents'
+                                Resource: '*'
+                            -
+                                Effect: Allow
+                                Action:
+                                    - 'elasticfilesystem:CreateFileSystem'
+                                    - 'elasticfilesystem:CreateMountTarget'
+                                Resource: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/*'
+                            -
+                                Effect: Allow
+                                Action:
+                                    - 'ec2:DescribeSubnets'
+                                    - 'ec2:CreateNetworkInterface'
+                                    - 'ec2:DescribeNetworkInterfaces'
+                                Resource: '*'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-fargate-task-role'
+
+    rFargateTaskDefinitionLambdaFunctionRole:
+        Type: 'AWS::IAM::Role'
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service:
+                                - lambda.amazonaws.com
+                        Action:
+                            - 'sts:AssumeRole'
+            Path: /
+            Policies:
+                -
+                    PolicyName: root
+                    PolicyDocument:
+                        Version: '2012-10-17'
+                        Statement:
+                            -
+                                Effect: Allow
+                                Action:
+                                    - 'logs:CreateLogGroup'
+                                    - 'logs:CreateLogStream'
+                                    - 'logs:PutLogEvents'
+                                Resource: '*'
+                            -
+                                Effect: Allow
+                                Action:
+                                    - 'iam:PassRole'
+                                Resource: '*'
+                            -
+                                Effect: Allow
+                                Action:
+                                    - 'ecs:RegisterTaskDefinition'
+                                    - 'ecs:DeregisterTaskDefinition'
+                                Resource: '*'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-fargate-task-definition-lambda-role'
+
+    rFargateTaskDefinitionLambdaFunctionLogGroup:
+        Type: 'AWS::Logs::LogGroup'
+        DependsOn:
+            - rFargateTaskDefinitionLambdaFunction
+        DeletionPolicy: Delete
+        Properties:
+            LogGroupName: !Sub '/aws/lambda/${rFargateTaskDefinitionLambdaFunction}'
+            RetentionInDays: 7
+
+    rFargateTaskDefinitionLambdaFunction:
+        Type: 'AWS::Lambda::Function'
+        Properties:
+            Runtime: python3.7
+            Timeout: 300
+            Handler: index.handler
+            Role: !GetAtt rFargateTaskDefinitionLambdaFunctionRole.Arn
+            Layers:
+                - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:python37_boto3_common:6'
+            Code:
+                ZipFile: !Sub
+                    - |-
+                        import json
+                        import logging
+                        import traceback
+                        import boto3
+                        import requests
+
+                        LOGGER = logging.getLogger()
+                        LOGGER.setLevel(logging.INFO)
+
+                        ECS_CLIENT = boto3.client('ecs')
+
+                        def send_cfn_response(event, context, response_status, response_data, physical_resource_id=None):
+                          response_body = {
+                            'Status': response_status,
+                            'Reason': 'See the details in CloudWatch Log Stream: {}'.format(context.log_stream_name),
+                            'PhysicalResourceId': physical_resource_id if physical_resource_id != None else context.log_stream_name,
+                            'StackId': event['StackId'],
+                            'RequestId': event['RequestId'],
+                            'LogicalResourceId': event['LogicalResourceId'],
+                            'Data': response_data
+                          }
+                          LOGGER.info('response_body: %s', response_body)
+                          try:
+                            req = requests.put(event['ResponseURL'], data=json.dumps(response_body))
+                            if req.status_code != 200:
+                              raise Exception('Failed to send response to CFN.')
+                          except requests.exceptions.RequestException as e:
+                            LOGGER.error(e)
+                            raise
+
+                        def register_task_definition(event, context):
+                          LOGGER.info('Creating EFS Task Definition')
+                          request_params = {
+                            'family': '${family}',
+                            'networkMode': 'awsvpc',
+                            'executionRoleArn': '${executionRoleArn}',
+                            'taskRoleArn': '${taskRoleArn}',
+                            'cpu': '1024',
+                            'memory': '4096',
+                            'containerDefinitions': [
+                              {
+                                'name': 'cloudcmd',
+                                'image': '${image}',
+                                'essential': True,
+                                'portMappings': [
+                                  {
+                                    'containerPort': ${containerPort}
+                                  }
+                                ],
+                                'mountPoints': [
+                                  {
+                                    'sourceVolume': 'uploads',
+                                    'containerPath': '/uploads',
+                                    'readOnly': False
+                                  }
+                                ],
+                                'logConfiguration': {
+                                  'logDriver': 'awslogs',
+                                  'options': {
+                                    'awslogs-group': '${log_group}',
+                                    'awslogs-region': '${region}',
+                                    'awslogs-stream-prefix': '${family}'
+                                  }
+                                }
+                              }
+                            ],
+                            'volumes': [
+                              {
+                                'name': 'uploads',
+                                'efsVolumeConfiguration': {
+                                  'fileSystemId': '${fileSystemId}',
+                                  'transitEncryption': 'ENABLED',
+                                  'authorizationConfig': {
+                                    'accessPointId': '${accessPointId}',
+                                    'iam': 'ENABLED'
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                          LOGGER.info('request_params: %s', request_params)
+                          response = ECS_CLIENT.register_task_definition(**request_params)
+                          task_definition_family = response['taskDefinition']['family']
+                          task_definition_family_rev = response['taskDefinition']['revision']
+                          task_definition = f"{task_definition_family}:{task_definition_family_rev}"
+                          return_data = {
+                            'TaskDefinition': task_definition
+                          }
+                          send_cfn_response(event, context, 'SUCCESS', return_data, task_definition)
+                          return task_definition
+
+                        def deregister_task_definition(event, context):
+                          LOGGER.info('Deleting EFS Task Definition')
+                          task_definition = event['PhysicalResourceId']
+                          ECS_CLIENT.deregister_task_definition(taskDefinition=task_definition)
+                          send_cfn_response(event, context, 'SUCCESS', {})
+
+                        def update_task_definition(event, context):
+                          LOGGER.info('Updating EFS Task Definition')
+                          deregister_task_definition(event, context)
+                          register_task_definition(event, context)
+
+                        def handler(event, context):
+                          LOGGER.info('Event: %s', event)
+                          try:
+                            if event['RequestType'] == 'Create':
+                              register_task_definition(event, context)
+                            elif event['RequestType'] == 'Update':
+                              update_task_definition(event, context)
+                            elif event['RequestType'] == 'Delete':
+                              deregister_task_definition(event, context)
+                          except Exception as err:
+                            LOGGER.error(err)
+                            traceback.print_exc()
+                            send_cfn_response(event, context, 'FAILED', {})
+                    -
+                        executionRoleArn: !Sub '${rFargateExecutionRole.Arn}'
+                        taskRoleArn: !Sub '${rFargateTaskRole.Arn}'
+                        fileSystemId: !Sub '${rEFS}'
+                        accessPointId: !Sub '${rAccessPointResource.Id}'
+                        image: !Sub '${pFargateTaskDockerImage}'
+                        containerPort: !Sub '${pFargateTaskContainerPort}'
+                        family: !Sub '${AWS::StackName}-${pFargateServiceName}'
+                        log_group: !Sub '${rFargateTaskLogGroup}'
+                        region: !Sub '${AWS::Region}'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-fargate-task-definition-lambda'
+
+    rFargateTaskDefinitionResource:
+        Type: 'Custom::FargateTaskDefinition'
+        Properties:
+            ServiceToken: !GetAtt rFargateTaskDefinitionLambdaFunction.Arn
+
+    rFargateTaskLogGroup:
+        Type: 'AWS::Logs::LogGroup'
+        DeletionPolicy: Delete
+        Properties:
+            LogGroupName: !Sub '/aws/ecs/${AWS::StackName}'
+            RetentionInDays: 7
+
+    rFargateAutoScalingRole:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: !Sub '${AWS::StackName}--${pFargateServiceName}-autoscaling-role'
+            AssumeRolePolicyDocument:
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: ecs-tasks.amazonaws.com
+                        Action: 'sts:AssumeRole'
+            ManagedPolicyArns:
+                - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-fargate-asg-role'
+
+    rContainerSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+            GroupDescription: !Sub '${AWS::StackName}-${pFargateServiceName}-container-sg'
+            VpcId: !Ref rVPC
+            SecurityGroupIngress:
+                -
+                    IpProtocol: tcp
+                    FromPort: !Ref pFargateTaskContainerPort
+                    ToPort: !Ref pFargateTaskContainerPort
+                    SourceSecurityGroupId: !Ref rLoadBalancerSecurityGroup
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-${pFargateServiceName}-container-sg'
+
+    rLoadBalancerSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: !Sub '${AWS::StackName}-${pFargateServiceName}-lb-sg'
+            VpcId: !Ref rVPC
+            SecurityGroupIngress:
+                -
+                    IpProtocol: tcp
+                    FromPort: 80
+                    ToPort: 80
+                    CidrIp: 0.0.0.0/0
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-${pFargateServiceName}-alb-sg'
+
+    rFargateService:
+        Type: AWS::ECS::Service
+        DependsOn:
+            - rListenerHTTP
+        Properties: 
+            ServiceName: !Sub '${AWS::StackName}-${pFargateServiceName}'
+            Cluster: !Ref rFargateCluster
+            TaskDefinition: !GetAtt rFargateTaskDefinitionResource.TaskDefinition
+            PlatformVersion: '1.4.0'
+            DeploymentConfiguration:
+                MinimumHealthyPercent: 100
+                MaximumPercent: 300
+            DesiredCount: 1
+            HealthCheckGracePeriodSeconds: 30
+            LaunchType: FARGATE
+            NetworkConfiguration: 
+                AwsvpcConfiguration:
+                    AssignPublicIp: ENABLED
+                    Subnets:
+                        - !Ref rPublicSubnet1
+                        - !Ref rPublicSubnet2
+                        - !Ref rPublicSubnet3
+                    SecurityGroups:
+                        - !Ref rContainerSecurityGroup
+            LoadBalancers:
+                -
+                    ContainerName: !Ref pFargateServiceName
+                    ContainerPort: !Ref pFargateTaskContainerPort
+                    TargetGroupArn: !Ref rLBTargetGroup
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-${pFargateServiceName}-service'
+
+    rLBTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            HealthCheckIntervalSeconds: 10
+            HealthCheckPath: '/'
+            HealthCheckTimeoutSeconds: 5
+            UnhealthyThresholdCount: 2
+            HealthyThresholdCount: 2
+            Name: !Sub '${AWS::StackName}-${pFargateServiceName}-tg'
+            Port: !Ref pFargateTaskContainerPort
+            Protocol: HTTP
+            TargetGroupAttributes:
+                -
+                    Key: deregistration_delay.timeout_seconds
+                    Value: '60'
+            TargetType: ip
+            VpcId: !Ref rVPC
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-alb-tg'
+
+    rListenerHTTP:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            DefaultActions:
+                -
+                    TargetGroupArn: !Ref rLBTargetGroup
+                    Type: forward
+            LoadBalancerArn: !Ref rLoadBalancer
+            Port: 80
+            Protocol: HTTP
+
+    rLoadBalancer:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            LoadBalancerAttributes:
+                -
+                    Key: idle_timeout.timeout_seconds
+                    Value: '60'
+            Name: !Sub '${AWS::StackName}-${pFargateServiceName}-lb'
+            Scheme: internet-facing
+            SecurityGroups:
+                - !Ref rLoadBalancerSecurityGroup
+            Subnets:
+                - !Ref rPublicSubnet1
+                - !Ref rPublicSubnet2
+                - !Ref rPublicSubnet3
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-alb'
+
+Outputs:
+    oLoadBalancerUrl:
+        Description: Fargate Service LoadBalancer URL
+        Value: !Sub 'http://${rLoadBalancer.DNSName}'
+        Export:
+            Name: !Sub '${AWS::StackName}-alb-url'
